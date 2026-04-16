@@ -1,0 +1,19 @@
+[project]
+name = "opencode-mlx-qwen-dflash"
+version = "0.1.0"
+description = "Local opencode + dflash + Qwen3.5-9B on Apple Silicon"
+requires-python = ">=3.10"
+dependencies = [
+    # mlx >= 0.31.0 ships ml-explore/mlx#3159 (Metal shared-event leak fix
+    # that closed mlx-lm#887). dflash-mlx itself only requires mlx>=0.25.0,
+    # so we pin the floor explicitly.
+    "mlx>=0.31.0",
+    "dflash-mlx",
+    "mlx-lm",
+    "huggingface_hub",
+]
+
+[tool.uv]
+# Resolve to the latest matching versions on every sync; we want the
+# Metal-event-leak fix and any subsequent fixes.
+resolution = "highest"

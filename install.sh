@@ -10,7 +10,8 @@ set -euo pipefail
 # -------------------------------------------------------------------------
 # Configuration (overridable via env vars)
 # -------------------------------------------------------------------------
-VENV_DIR="${VENV_DIR:-$HOME/dflash-env}"
+# Project root = directory of this script. uv manages a .venv here.
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DFLASH_PORT="${DFLASH_PORT:-8000}"
 TARGET_MODEL="${TARGET_MODEL:-Qwen/Qwen3.5-9B}"
 DRAFT_MODEL="${DRAFT_MODEL:-z-lab/Qwen3.5-9B-DFlash}"
@@ -21,9 +22,9 @@ OPENCODE_CONFIG="$OPENCODE_CONFIG_DIR/opencode.json"
 MIN_MACOS_MAJOR=14         # Sonoma. Earlier macOS lacks Metal 3 features mlx uses.
 MIN_FREE_DISK_GB=30        # ~20 GB models + buffer
 MIN_RAM_GB=16              # Qwen3.5-9B bf16 + draft + KV cache need ~22 GB
-MIN_PYTHON_MAJOR=3
-MIN_PYTHON_MINOR=10
 MIN_MLX_VERSION="0.31.0"   # ml-explore/mlx#3159 (Metal event leak fix)
+# Python version is enforced by pyproject.toml (requires-python). uv will
+# install a matching Python automatically if the system one is too old.
 
 LOG_PREFIX="[install]"
 SERVER_LOG="/tmp/dflash-serve.log"
@@ -117,20 +118,10 @@ preflight() {
     errors+=("Xcode Command Line Tools not installed.|Install with: xcode-select --install (then re-run this script).")
   fi
 
-  # Python: check it exists *and* is recent enough. If brew is available
-  # we'll auto-upgrade; otherwise this needs to fail.
-  local have_python_ok=0
-  if command -v python3 >/dev/null 2>&1; then
-    local py_major py_minor
-    py_major=$(python3 -c 'import sys; print(sys.version_info.major)' 2>/dev/null || echo 0)
-    py_minor=$(python3 -c 'import sys; print(sys.version_info.minor)' 2>/dev/null || echo 0)
-    if [[ "$py_major" -gt "$MIN_PYTHON_MAJOR" ]] || \
-       [[ "$py_major" -eq "$MIN_PYTHON_MAJOR" && "$py_minor" -ge "$MIN_PYTHON_MINOR" ]]; then
-      have_python_ok=1
-    fi
-  fi
-  if [[ "$have_python_ok" -eq 0 ]] && ! command -v brew >/dev/null 2>&1; then
-    errors+=("Python >= ${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR} not found and Homebrew is missing (can't auto-install).|Install Homebrew first: /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"  — or install Python ${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR}+ another way.")
+  # uv handles Python install if needed (uv python install). We just need
+  # uv itself; brew can install it. If neither is present, ask the user.
+  if ! command -v uv >/dev/null 2>&1 && ! command -v brew >/dev/null 2>&1; then
+    errors+=("Neither 'uv' nor Homebrew is installed.|Install uv: curl -LsSf https://astral.sh/uv/install.sh | sh   — or install Homebrew (https://brew.sh) and re-run this script (we'll brew-install uv automatically).")
   fi
 
   # Print all errors at once so user can fix them in one pass.
@@ -172,26 +163,19 @@ ensure_homebrew() {
            "Add to your shell rc: eval \"\$(/opt/homebrew/bin/brew shellenv)\""
 }
 
-ensure_python() {
-  local need_install=0
-  if ! command -v python3 >/dev/null 2>&1; then
-    need_install=1
-  else
-    local py_major py_minor
-    py_major=$(python3 -c 'import sys; print(sys.version_info.major)')
-    py_minor=$(python3 -c 'import sys; print(sys.version_info.minor)')
-    if [[ "$py_major" -lt "$MIN_PYTHON_MAJOR" ]] || \
-       [[ "$py_major" -eq "$MIN_PYTHON_MAJOR" && "$py_minor" -lt "$MIN_PYTHON_MINOR" ]]; then
-      need_install=1
-    fi
+ensure_uv() {
+  if command -v uv >/dev/null 2>&1; then
+    say "uv: $(uv --version)"
+    return
   fi
-  if [[ "$need_install" -eq 1 ]]; then
-    say "Installing Python via Homebrew..."
-    brew install python@3.12 \
-      || die "Failed to install Python." \
-             "Try: brew doctor   (then re-run this script)."
-  fi
-  say "Python: $(python3 --version)"
+  say "Installing uv via Homebrew..."
+  brew install uv \
+    || die "Failed to install uv via brew." \
+           "Install manually: curl -LsSf https://astral.sh/uv/install.sh | sh   then re-run this script."
+  command -v uv >/dev/null 2>&1 \
+    || die "uv installed but not on PATH." \
+           "Restart your shell or add /opt/homebrew/bin to PATH, then re-run."
+  say "uv: $(uv --version)"
 }
 
 ensure_opencode() {
@@ -206,54 +190,55 @@ ensure_opencode() {
   say "opencode: $(opencode --version)"
 }
 
-ensure_venv_and_deps() {
-  if [[ ! -d "$VENV_DIR" ]]; then
-    say "Creating Python venv at $VENV_DIR..."
-    python3 -m venv "$VENV_DIR" \
-      || die "venv creation failed at $VENV_DIR." \
-             "Check disk space and write permissions on \$HOME, then retry."
+ensure_uv_env_and_deps() {
+  cd "$PROJECT_DIR" \
+    || die "Cannot cd to $PROJECT_DIR." "Check the script lives in a real directory."
+
+  if [[ ! -f "$PROJECT_DIR/pyproject.toml" ]]; then
+    die "pyproject.toml missing in $PROJECT_DIR." \
+        "Re-clone the repo; pyproject.toml ships with it."
   fi
-  # shellcheck source=/dev/null
-  source "$VENV_DIR/bin/activate"
 
-  say "Upgrading pip..."
-  pip install --upgrade pip --quiet \
-    || die "pip self-upgrade failed." \
-           "Likely a network issue. Check connectivity to pypi.org and retry."
+  # uv sync creates/updates .venv from pyproject.toml. It's idempotent and
+  # MUCH faster than pip on re-runs (resolves+verifies in seconds).
+  # uv handles installing a matching Python interpreter automatically if
+  # the system one is too old.
+  say "uv sync (creates .venv if needed; installs/verifies deps)..."
+  uv sync 2>&1 | sed "s/^/$LOG_PREFIX   /" \
+    || die "uv sync failed." \
+           "Run 'uv sync' from $PROJECT_DIR to see the full error. Common: network proxy blocking pypi.org or huggingface.co; corrupt .venv (delete .venv/ and retry); incompatible Python version (uv should auto-fix)."
 
-  say "Installing MLX, dflash-mlx, mlx-lm, huggingface_hub..."
-  # mlx>=0.31.0 carries ml-explore/mlx#3159 (Metal event leak fix). dflash-mlx
-  # only requires mlx>=0.25.0 so we pin explicitly.
-  pip install --quiet "mlx>=${MIN_MLX_VERSION}" dflash-mlx "huggingface_hub[cli]" mlx-lm \
-    || die "pip install of MLX/dflash failed." \
-           "Run 'pip install \"mlx>=${MIN_MLX_VERSION}\" dflash-mlx mlx-lm' inside the venv to see the full error. Common causes: outdated pip, network proxy, or no arm64 wheel for your Python version."
-
-  local mlx_ver
-  mlx_ver=$(python3 -c 'import mlx.core as m; print(m.__version__)' 2>/dev/null) \
-    || die "MLX failed to import after install." \
-           "Re-run this script; if it persists, delete $VENV_DIR and start over."
-  say "MLX: $mlx_ver"
-
-  python3 - "$mlx_ver" "$MIN_MLX_VERSION" <<'PY' || die "MLX version check failed." \
-    "MLX $(python3 -c 'import mlx.core as m; print(m.__version__)') is below the required ${MIN_MLX_VERSION}. Try: pip install -U \"mlx>=${MIN_MLX_VERSION}\""
+  # Sanity: import everything end-to-end and check MLX version meets floor.
+  uv run python - <<PY \
+    || die "Post-install sanity check failed (imports or MLX version too old)." \
+           "Try: rm -rf $PROJECT_DIR/.venv && uv sync"
 import sys
+import mlx.core as mx
+import dflash_mlx  # noqa: F401
+import mlx_lm  # noqa: F401
+import huggingface_hub  # noqa: F401
 def parse(v): return tuple(int(x) for x in v.split('.')[:3])
-sys.exit(0 if parse(sys.argv[1]) >= parse(sys.argv[2]) else 1)
+required = parse("${MIN_MLX_VERSION}")
+got = parse(mx.__version__)
+if got < required:
+    sys.stderr.write(f"MLX {mx.__version__} < required {'.'.join(map(str, required))}\n")
+    sys.exit(1)
+print(f"  mlx={mx.__version__} dflash-mlx + mlx-lm + huggingface_hub OK")
 PY
-
-  python3 -c "import dflash_mlx" 2>/dev/null \
-    || die "dflash-mlx failed to import after install." \
-           "Try: pip install --force-reinstall dflash-mlx"
-  say "dflash-mlx: installed"
 }
 
 patch_serve_py() {
+  # Locate serve.py inside the uv-managed .venv via the import system,
+  # avoiding any python3.X subdirectory guesswork.
   local serve_py
-  serve_py="$VENV_DIR/lib/python$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')/site-packages/dflash_mlx/serve.py"
+  serve_py=$(uv run python -c \
+    'import dflash_mlx.serve, sys; sys.stdout.write(dflash_mlx.serve.__file__)' 2>/dev/null) \
+    || die "Could not locate dflash_mlx/serve.py via uv run." \
+           "Re-run 'uv sync' from $PROJECT_DIR; if that fails, delete .venv and re-run this script."
 
   if [[ ! -f "$serve_py" ]]; then
     die "Cannot find $serve_py." \
-        "dflash-mlx layout may have changed. Run 'pip show -f dflash-mlx' to find serve.py and report the path."
+        "dflash-mlx layout may have changed. Run 'uv run python -c \"import dflash_mlx.serve as s; print(s.__file__)\"' to investigate."
   fi
 
   if grep -q "_normalize_messages" "$serve_py"; then
@@ -314,17 +299,18 @@ PY
 download_models() {
   say "Downloading $TARGET_MODEL (~18 GB) and $DRAFT_MODEL (~2 GB)..."
   say "  (Resume-safe; Ctrl-C and re-run if interrupted.)"
-  hf download "$TARGET_MODEL" \
+  uv run hf download "$TARGET_MODEL" \
     || die "Download of $TARGET_MODEL failed." \
-           "Common causes: gated model needs HF login (run 'hf auth login'), no disk space, or network drop. Re-run this script — downloads resume."
-  hf download "$DRAFT_MODEL" \
+           "Common causes: gated model needs HF login (run 'uv run hf auth login'), no disk space, or network drop. Re-run this script — downloads resume."
+  uv run hf download "$DRAFT_MODEL" \
     || die "Download of $DRAFT_MODEL failed." \
            "Same fixes as above. Re-run this script — downloads resume."
 }
 
 dflash_smoke_test() {
   say "Smoke test: dflash CLI generation..."
-  if ! dflash --model "$TARGET_MODEL" \
+  if ! uv run dflash \
+              --model "$TARGET_MODEL" \
               --prompt "Reply with exactly the text: dflash-ready" \
               --max-tokens 24 >/tmp/dflash-smoke.log 2>&1; then
     cat /tmp/dflash-smoke.log >&2
@@ -333,7 +319,7 @@ dflash_smoke_test() {
           "1. Verify MLX >= ${MIN_MLX_VERSION} (this script enforces it). 2. Reboot — the macOS Metal event pool only resets cleanly that way. 3. Re-run this script."
     fi
     die "dflash CLI generation failed." \
-        "See /tmp/dflash-smoke.log above. Common: model not fully downloaded (re-run step 7), or out-of-memory (close other apps)."
+        "See /tmp/dflash-smoke.log above. Common: model not fully downloaded (re-run script — downloads resume), or out-of-memory (close other apps)."
   fi
   say "dflash CLI works."
 }
@@ -354,8 +340,12 @@ start_server() {
         "Either kill it (kill $existing) and re-run, or set DFLASH_PORT=<other> and re-run."
   fi
   say "Starting dflash-serve on port $DFLASH_PORT (log: $SERVER_LOG)..."
-  nohup dflash-serve --model "$TARGET_MODEL" --port "$DFLASH_PORT" \
-    > "$SERVER_LOG" 2>&1 &
+  # main() chdir'd to $PROJECT_DIR. uv run executes within that project's
+  # .venv. We capture the bash background PID; uv typically execs the
+  # underlying Python process so this PID is what we kill later.
+  nohup uv run dflash-serve \
+      --model "$TARGET_MODEL" --port "$DFLASH_PORT" \
+      > "$SERVER_LOG" 2>&1 &
   echo $! > "$SERVER_PID_FILE"
   local pid
   pid=$(cat "$SERVER_PID_FILE")
@@ -517,8 +507,14 @@ Use it:
 Stop the server:
   kill \$(cat $SERVER_PID_FILE)
 
-Re-activate the venv later:
-  source $VENV_DIR/bin/activate
+Restart the server later (no env activation — uv handles it):
+  cd $PROJECT_DIR
+  nohup uv run dflash-serve --model $TARGET_MODEL --port $DFLASH_PORT \\
+    > $SERVER_LOG 2>&1 &
+  echo \$! > $SERVER_PID_FILE
+
+Run anything in the project's env without activating:
+  cd $PROJECT_DIR && uv run <command>      # e.g. uv run python, uv run dflash
 
 If you ever see "RuntimeError: [Event::Event] Failed to create Metal
 shared event":
@@ -536,11 +532,13 @@ EOF
 # -------------------------------------------------------------------------
 main() {
   say "DFlash + opencode + $TARGET_MODEL setup starting."
+  say "Project dir: $PROJECT_DIR"
+  cd "$PROJECT_DIR" || die "Cannot enter $PROJECT_DIR." "Check the script lives in a real directory."
   preflight
   ensure_homebrew
-  ensure_python
+  ensure_uv
   ensure_opencode
-  ensure_venv_and_deps
+  ensure_uv_env_and_deps
   patch_serve_py
   download_models
   dflash_smoke_test

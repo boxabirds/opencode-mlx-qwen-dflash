@@ -15,11 +15,12 @@ download.
 
 1. Verifies your Mac meets the prerequisites (preflight bails early with a
    list of fixes if not).
-2. Installs Homebrew (if missing), Python 3.10+, and `opencode` from the
-   official Homebrew formula.
-3. Creates a Python venv at `~/dflash-env` and installs `mlx>=0.31.0`
-   (specifically pinned to include the Metal-event-leak fix —
+2. Installs Homebrew (if missing), `uv` (the fast Python package manager),
+   and `opencode` — all from the official Homebrew formulas.
+3. Runs `uv sync` to create a project-local `.venv` from `pyproject.toml`
+   and install `mlx>=0.31.0` (which carries the Metal-event-leak fix —
    ml-explore/mlx#3159), `dflash-mlx`, `mlx-lm`, and `huggingface_hub`.
+   uv installs a matching Python automatically if your system one is too old.
 4. Patches `dflash_mlx/serve.py` to coalesce interleaved system messages.
    Qwen3.5's chat template otherwise rejects them with
    *"System message must be at the beginning."* The patch is **idempotent**
@@ -53,11 +54,11 @@ are missing.
 | CPU | Apple Silicon (M1+) | MLX is arm64-only |
 | RAM | 16 GB unified (warn) | 22 GB used at runtime; less than 16 GB will swap |
 | Free disk | 30 GB in `$HOME` | Models ~20 GB + venv + buffer |
-| Python | 3.10+ | Auto-installed via brew if missing |
+| Python | 3.10+ | Auto-installed by `uv` if your system one is too old |
 | Xcode CLT | installed | `xcode-select --install` if not |
-| Network | reachable `huggingface.co` | For model + package downloads |
+| Network | reachable `huggingface.co`, `pypi.org`, `astral.sh` | For model + package downloads |
 
-Homebrew and `opencode` are auto-installed by the script if missing.
+Homebrew, `uv`, and `opencode` are auto-installed by the script if missing.
 
 ## Install
 
@@ -71,10 +72,12 @@ Configurable via env vars:
 
 | Variable | Default | What |
 |---|---|---|
-| `VENV_DIR` | `~/dflash-env` | Python venv location |
 | `DFLASH_PORT` | `8000` | Local server port |
 | `TARGET_MODEL` | `Qwen/Qwen3.5-9B` | Target (verifier) model |
 | `DRAFT_MODEL` | `z-lab/Qwen3.5-9B-DFlash` | Draft model for speculative decoding |
+
+The Python env lives at `.venv/` inside the cloned repo (managed by `uv`).
+There's nothing to "activate" — every command goes through `uv run`.
 
 The installer is **idempotent** — re-run it any time. It detects existing
 state (venv, downloaded models, patched serve.py, port already bound) and
@@ -98,12 +101,24 @@ To stop the background server:
 kill $(cat /tmp/dflash-serve.pid)
 ```
 
-To restart it later (after a reboot, say):
+To restart it later (after a reboot, say) — no env activation needed:
 
 ```bash
-source ~/dflash-env/bin/activate
-dflash-serve --model Qwen/Qwen3.5-9B --port 8000 > /tmp/dflash-serve.log 2>&1 &
+cd /path/to/opencode-mlx-qwen-dflash
+nohup uv run dflash-serve --model Qwen/Qwen3.5-9B --port 8000 \
+  > /tmp/dflash-serve.log 2>&1 &
 echo $! > /tmp/dflash-serve.pid
+```
+
+Or just re-run `./install.sh` — it detects the existing setup, skips
+everything that's already done, and brings the server back up.
+
+Run anything else in the project's Python env without activating:
+
+```bash
+cd /path/to/opencode-mlx-qwen-dflash
+uv run python                     # REPL
+uv run dflash --model Qwen/Qwen3.5-9B --prompt "hi"
 ```
 
 ## Troubleshooting
@@ -153,12 +168,15 @@ hf auth login   # or set HF_TOKEN
 
 ## Files this script touches
 
-- `~/dflash-env/` — Python venv (delete to start fresh)
-- `~/dflash-env/lib/python*/site-packages/dflash_mlx/serve.py` — patched
+- `<repo>/.venv/` — uv-managed Python env (delete to start fresh; `uv sync`
+  rebuilds it)
+- `<repo>/uv.lock` — lockfile uv writes for reproducibility
+- `<repo>/.venv/lib/python*/site-packages/dflash_mlx/serve.py` — patched
   in place; backup written alongside as `serve.py.bak.<timestamp>`
 - `~/.cache/huggingface/hub/` — downloaded model weights
-- `~/.config/opencode/opencode.json` — provider + agent config
-  (existing file backed up to `opencode.json.bak.<timestamp>`)
+- `~/.config/opencode/opencode.json` — provider + agent config (global,
+  visible from any directory; existing file backed up to
+  `opencode.json.bak.<timestamp>`)
 - `/tmp/dflash-serve.log` — server stdout/stderr
 - `/tmp/dflash-serve.pid` — server PID
 
