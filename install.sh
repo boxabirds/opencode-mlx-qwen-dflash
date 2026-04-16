@@ -342,9 +342,16 @@ start_server() {
   if lsof -i ":$DFLASH_PORT" >/dev/null 2>&1; then
     local existing
     existing=$(lsof -ti ":$DFLASH_PORT" 2>/dev/null | head -1)
-    warn "Port $DFLASH_PORT already in use (PID $existing). Skipping server start."
-    warn "  If that's a stale dflash-serve, kill it: kill $existing"
-    return
+    # Verify it's actually our dflash-serve answering OpenAI requests, not
+    # some unrelated process squatting on the port.
+    if curl -sf -m 2 "http://localhost:$DFLASH_PORT/v1/models" >/dev/null 2>&1; then
+      say "dflash-serve already running on :$DFLASH_PORT (PID $existing). Reusing."
+      # Refresh PID file so later steps reference the actual running PID.
+      echo "$existing" > "$SERVER_PID_FILE"
+      return
+    fi
+    die "Port $DFLASH_PORT is bound by PID $existing but it doesn't speak the OpenAI API." \
+        "Either kill it (kill $existing) and re-run, or set DFLASH_PORT=<other> and re-run."
   fi
   say "Starting dflash-serve on port $DFLASH_PORT (log: $SERVER_LOG)..."
   nohup dflash-serve --model "$TARGET_MODEL" --port "$DFLASH_PORT" \
@@ -384,25 +391,24 @@ write_opencode_config() {
     || die "Cannot create $OPENCODE_CONFIG_DIR." \
            "Check permissions on \$HOME/.config."
 
-  if [[ -f "$OPENCODE_CONFIG" ]]; then
-    local backup="$OPENCODE_CONFIG.bak.$(date +%s)"
-    cp "$OPENCODE_CONFIG" "$backup" \
-      || die "Could not back up existing opencode.json to $backup." \
-             "Check permissions on $OPENCODE_CONFIG_DIR."
-    say "Backed up existing opencode.json to $(basename "$backup")."
-  fi
+  # Compute the desired config and only write (and back up) if it differs
+  # from what's already on disk. Re-runs of the script with no changes
+  # leave the file untouched and don't accumulate timestamped backups.
+  local tmp
+  tmp=$(mktemp -t opencode-config-XXXXXX.json) \
+    || die "mktemp failed." "Check /tmp is writable."
+  trap "rm -f '$tmp'" RETURN
 
-  python3 - "$OPENCODE_CONFIG" "$DFLASH_PORT" "$TARGET_MODEL" <<'PY' \
-    || die "Failed to write opencode.json." \
-           "Check that $OPENCODE_CONFIG is writable. If JSON in an existing config is corrupt, delete it and re-run."
+  python3 - "$tmp" "$DFLASH_PORT" "$TARGET_MODEL" "${OPENCODE_CONFIG}" <<'PY' \
+    || die "Failed to compose opencode.json." \
+           "If existing $OPENCODE_CONFIG has corrupt JSON, delete it and re-run."
 import json, pathlib, sys
-path = pathlib.Path(sys.argv[1])
-port = sys.argv[2]
-model = sys.argv[3]
+out = pathlib.Path(sys.argv[1])
+port, model, existing = sys.argv[2], sys.argv[3], pathlib.Path(sys.argv[4])
 cfg = {}
-if path.exists():
+if existing.exists():
     try:
-        cfg = json.loads(path.read_text())
+        cfg = json.loads(existing.read_text())
     except Exception as exc:
         sys.stderr.write(f"warning: existing opencode.json is invalid JSON ({exc}); replacing.\n")
         cfg = {}
@@ -435,15 +441,40 @@ cfg["agent"]["qwen-chat"] = {
     },
     "prompt": "You are a concise coding assistant. Answer in plain text or fenced code blocks. Do not use tools.",
 }
-path.write_text(json.dumps(cfg, indent=2) + "\n")
-print(f"Wrote {path}")
+out.write_text(json.dumps(cfg, indent=2) + "\n")
 PY
+
+  if [[ -f "$OPENCODE_CONFIG" ]] && cmp -s "$tmp" "$OPENCODE_CONFIG"; then
+    say "opencode.json already up to date."
+    return
+  fi
+
+  if [[ -f "$OPENCODE_CONFIG" ]]; then
+    local backup="$OPENCODE_CONFIG.bak.$(date +%s)"
+    cp "$OPENCODE_CONFIG" "$backup" \
+      || die "Could not back up existing opencode.json to $backup." \
+             "Check permissions on $OPENCODE_CONFIG_DIR."
+    say "Backed up existing opencode.json to $(basename "$backup")."
+  fi
+
+  cp "$tmp" "$OPENCODE_CONFIG" \
+    || die "Failed to write $OPENCODE_CONFIG." \
+           "Check that $OPENCODE_CONFIG is writable."
+  say "Wrote $OPENCODE_CONFIG."
 }
 
 opencode_smoke_test() {
   say "Smoke test: opencode -> dflash -> Qwen3.5..."
   local sess_dir="$HOME/.local/share/opencode/storage/part"
   mkdir -p "$sess_dir"
+
+  # Stamp a marker NOW so we only consider session files created after this
+  # point. Without this, a re-run picks up a stale response from a prior
+  # run and reports "success" even if this run produced nothing.
+  local marker
+  marker=$(mktemp -t dflash-smoke-marker-XXXXXX) \
+    || die "mktemp failed." "Check /tmp is writable."
+  trap "rm -f '$marker'" RETURN
 
   # opencode run only renders to a TTY, so its stdout is useless without one.
   # We let it write into its own session storage and read the result back.
@@ -452,13 +483,13 @@ opencode_smoke_test() {
       >/dev/null 2>&1 ) || true
 
   local new_part
-  new_part=$(find "$sess_dir" -type f -newer "$SERVER_PID_FILE" 2>/dev/null \
+  new_part=$(find "$sess_dir" -type f -newer "$marker" 2>/dev/null \
     | xargs grep -l '"type": "text"' 2>/dev/null \
     | xargs grep -l '```' 2>/dev/null \
     | xargs ls -t 2>/dev/null | head -1 || true)
 
   if [[ -z "$new_part" ]]; then
-    warn "Smoke test produced no opencode response in 120s."
+    warn "Smoke test produced no NEW opencode response in 120s."
     warn "  Setup is likely still functional — try interactively: opencode run --agent qwen-chat \"hi\""
     warn "  Server log: $SERVER_LOG"
     return
