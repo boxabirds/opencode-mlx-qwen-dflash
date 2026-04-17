@@ -13,15 +13,22 @@ set -euo pipefail
 # Project root = directory of this script. uv manages a .venv here.
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DFLASH_PORT="${DFLASH_PORT:-8000}"
-TARGET_MODEL="${TARGET_MODEL:-Qwen/Qwen3.5-9B}"
-DRAFT_MODEL="${DRAFT_MODEL:-z-lab/Qwen3.5-9B-DFlash}"
+# Qwen3.5-35B-A3B is the sweet spot for Macs with >= 96 GB unified memory:
+# 35B total params but only ~3B active per token (MoE), so inference is fast
+# while reasoning is closer to a 35B dense model. ~71 GB on disk + ~75 GB
+# loaded. Override on smaller Macs:
+#   TARGET_MODEL=Qwen/Qwen3.5-9B DRAFT_MODEL=z-lab/Qwen3.5-9B-DFlash ./install.sh
+# See README.md "Choosing a model" for the full table.
+TARGET_MODEL="${TARGET_MODEL:-Qwen/Qwen3.5-35B-A3B}"
+DRAFT_MODEL="${DRAFT_MODEL:-z-lab/Qwen3.5-35B-A3B-DFlash}"
 OPENCODE_CONFIG_DIR="$HOME/.config/opencode"
 OPENCODE_CONFIG="$OPENCODE_CONFIG_DIR/opencode.json"
 
-# Minimum requirements
+# Minimum requirements. Defaults assume the 35B-A3B target. Override
+# TARGET_MODEL/DRAFT_MODEL for a smaller model on a smaller Mac.
 MIN_MACOS_MAJOR=14         # Sonoma. Earlier macOS lacks Metal 3 features mlx uses.
-MIN_FREE_DISK_GB=30        # ~20 GB models + buffer
-MIN_RAM_GB=16              # Qwen3.5-9B bf16 + draft + KV cache need ~22 GB
+MIN_FREE_DISK_GB=90        # 35B-A3B target ~71 GB + draft ~1 GB + buffer
+MIN_RAM_GB=96              # 35B-A3B at bf16 needs ~75 GB loaded + KV cache
 MIN_MLX_VERSION="0.31.0"   # ml-explore/mlx#3159 (Metal event leak fix)
 # Python version is enforced by pyproject.toml (requires-python). uv will
 # install a matching Python automatically if the system one is too old.
@@ -241,59 +248,30 @@ patch_serve_py() {
         "dflash-mlx layout may have changed. Run 'uv run python -c \"import dflash_mlx.serve as s; print(s.__file__)\"' to investigate."
   fi
 
-  if grep -q "_normalize_messages" "$serve_py"; then
+  # Two patches in one: (1) coalesce system messages so Qwen3.5's chat
+  # template accepts them, (2) lift Qwen's qwen3_coder XML tool calls into
+  # OpenAI tool_calls JSON. Both are applied by patch_serve_py.py, which
+  # is idempotent (looks for marker "DFLASH_QWEN_TOOL_PATCH_v1" before
+  # patching and skips if present). Backup written before any edit.
+  if grep -q "DFLASH_QWEN_TOOL_PATCH_v1" "$serve_py"; then
     say "serve.py already patched (idempotent)."
     return
   fi
+  say "Patching $serve_py (system-message coalesce + qwen3_coder tool adapter)..."
+  cp "$serve_py" "$serve_py.bak.$(date +%s)" \
+    || die "Could not write backup $serve_py.bak.<ts>." \
+           "Check write permission on the .venv site-packages dir."
 
-  say "Patching $serve_py to coalesce system messages (Qwen3.5 chat-template fix)..."
-  cp "$serve_py" "$serve_py.bak.$(date +%s)"
-
-  python3 - "$serve_py" <<'PY' \
+  uv run python "$PROJECT_DIR/patch_serve_py.py" "$serve_py" "$PROJECT_DIR" \
     || die "serve.py patch failed." \
-           "Restore from backup: cp $serve_py.bak.* $serve_py   then file an issue with your dflash-mlx version."
-import re, sys, pathlib
-path = pathlib.Path(sys.argv[1])
-src = path.read_text()
-patch = '''def _normalize_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Coalesce all system messages into one at position 0.
+           "Restore from backup: cp $serve_py.bak.* $serve_py — then re-run with patch_serve_py.py output captured to file an issue. dflash-mlx may have changed; check $PROJECT_DIR/patch_serve_py.py for anchor strings that no longer match."
 
-    Qwen3.5's chat template requires the system message to be at the
-    beginning. Some clients (e.g. opencode) interleave system messages with
-    user/assistant turns, which the template rejects with
-    'System message must be at the beginning.'.
-    """
-    system_parts: list[str] = []
-    other: list[dict[str, Any]] = []
-    for message in messages:
-        if str(message.get("role", "")) == "system":
-            text = _message_text(message).strip()
-            if text:
-                system_parts.append(text)
-        else:
-            other.append(message)
-    if not system_parts:
-        return other
-    combined = {"role": "system", "content": "\\n\\n".join(system_parts)}
-    return [combined, *other]
-
-
-'''
-needle = "def _build_prompt_request("
-if needle not in src:
-    sys.stderr.write("anchor 'def _build_prompt_request(' not found in serve.py\n")
-    sys.exit(2)
-idx = src.index(needle)
-src = src[:idx] + patch + src[idx:]
-old = 'messages = list(payload.get("messages") or [])'
-new = 'messages = _normalize_messages(list(payload.get("messages") or []))'
-if old not in src:
-    sys.stderr.write("anchor for messages assignment not found in serve.py\n")
-    sys.exit(3)
-src = src.replace(old, new, 1)
-path.write_text(src)
-print("patched")
-PY
+  # Sanity: patched module must still import.
+  uv run python -c \
+    "import importlib, dflash_mlx.serve; importlib.reload(dflash_mlx.serve); assert hasattr(dflash_mlx.serve, '_qta_make_response_with_tools')" \
+    >/dev/null 2>&1 \
+    || die "Patched serve.py fails to import." \
+           "Restore from $serve_py.bak.* and report the failure."
 }
 
 download_models() {
@@ -414,13 +392,21 @@ cfg["provider"]["dflash"] = {
     "models": {
         model: {
             "name": f"{model} + DFlash",
-            "limit": {"context": 32000, "output": 256},
+            # 2048 output gives headroom for thinking + tool-call XML + reply;
+            # 32k context is enough for build-agent tool definitions plus
+            # repo file reads.
+            "limit": {"context": 32000, "output": 2048},
         }
     },
 }
 cfg.setdefault("agent", {})
+# Two agents: a fast no-tools chat, and a full-tools agentic coder.
+# qwen-chat keeps prompts small (no tool definitions injected) so one-shot
+# code questions return quickly. qwen-coder enables the full opencode tool
+# suite — read/edit/bash/etc — and relies on the patched dflash-serve
+# (qwen3_coder XML → OpenAI tool_calls adapter) to make tool calling work.
 cfg["agent"]["qwen-chat"] = {
-    "description": f"Plain chat with {model} via DFlash (no tools)",
+    "description": f"Fast chat with {model} via DFlash — no tools, plain text only",
     "mode": "primary",
     "model": f"dflash/{model}",
     "tools": {
@@ -430,6 +416,19 @@ cfg["agent"]["qwen-chat"] = {
         "webfetch": False,
     },
     "prompt": "You are a concise coding assistant. Answer in plain text or fenced code blocks. Do not use tools.",
+}
+cfg["agent"]["qwen-coder"] = {
+    "description": f"Agentic coder using {model} via DFlash with full tool access",
+    "mode": "primary",
+    "model": f"dflash/{model}",
+    # No tools restriction → opencode injects all defaults. Tool calls go
+    # out as Qwen's qwen3_coder XML and are converted to OpenAI tool_calls
+    # by the patched dflash-serve.
+    "prompt": (
+        "You are an autonomous coding agent. Use the provided tools to read "
+        "the user's repository, make precise edits, and run commands. Prefer "
+        "concrete actions over long explanations."
+    ),
 }
 out.write_text(json.dumps(cfg, indent=2) + "\n")
 PY
@@ -501,8 +500,13 @@ Server:  dflash-serve on http://localhost:$DFLASH_PORT/v1
          (PID $pid; log: $SERVER_LOG)
 
 Use it:
-  opencode run --agent qwen-chat "your prompt here"
-  opencode --agent qwen-chat        # interactive TUI
+  opencode --agent qwen-chat                # fast chat (no tools, ~few s/turn)
+  opencode --agent qwen-coder               # agentic (full tools, slower per turn)
+  opencode run --agent qwen-coder "..."     # one-shot with tool access
+
+  qwen-chat is for code Q&A and snippet generation. qwen-coder gives the model
+  read/edit/bash/etc and routes Qwen's qwen3_coder XML tool calls through the
+  patched dflash-serve into OpenAI tool_calls JSON.
 
 Stop the server:
   kill \$(cat $SERVER_PID_FILE)
@@ -530,6 +534,17 @@ EOF
 # -------------------------------------------------------------------------
 # Main
 # -------------------------------------------------------------------------
+test_qwen_tool_adapter() {
+  # Pure-Python unit tests for the qwen3_coder → OpenAI tool-call adapter.
+  # No GPU needed — runs in milliseconds. Catches a broken adapter before
+  # the real model ever runs.
+  say "Testing qwen_tool_adapter (15 unit tests)..."
+  uv run python -m unittest test_qwen_tool_adapter >/tmp/qwen-adapter-tests.log 2>&1 \
+    || { tail -30 /tmp/qwen-adapter-tests.log >&2; \
+         die "qwen_tool_adapter unit tests failed." \
+             "Inspect /tmp/qwen-adapter-tests.log. The patched serve.py needs the adapter; if tests fail, opencode tool-call routing won't work."; }
+}
+
 main() {
   say "DFlash + opencode + $TARGET_MODEL setup starting."
   say "Project dir: $PROJECT_DIR"
@@ -539,6 +554,7 @@ main() {
   ensure_uv
   ensure_opencode
   ensure_uv_env_and_deps
+  test_qwen_tool_adapter
   patch_serve_py
   download_models
   dflash_smoke_test
