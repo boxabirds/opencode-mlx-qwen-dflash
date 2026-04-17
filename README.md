@@ -1,5 +1,7 @@
 # opencode-mlx-qwen-dflash
 
+> **Status: paused for a week or so until we have Qwen3.6-dflash as it's a big step forward.**
+
 A one-shot installer that wires together a fast local code-generation stack
 on Apple Silicon: **opencode** (terminal coding agent) → **DFlash**
 (speculative decoding for MLX) → **Qwen3.5-9B** running on your Mac's
